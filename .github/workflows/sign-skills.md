@@ -1,0 +1,43 @@
+name: Sign instruction files
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'SKILLS.md'
+      - 'CLAUDE.md'
+      - 'AGENT.MD'
+
+permissions:
+  id-token: write
+  contents: write
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install nono
+        run: cargo install --path crates/nono-cli
+        # Or: cargo install nono-cli (once published)
+
+      - name: Sign instruction files (keyless)
+        run: |
+          for f in SKILLS.md CLAUDE.md AGENT.MD; do
+            if [ -f "$f" ]; then
+              nono trust sign "$f" --keyless
+            fi
+          done
+
+      - name: Commit bundles
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add '*.bundle'
+          git diff --staged --quiet || git commit -m "chore: update instruction file signatures"
+          git push
+
