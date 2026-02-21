@@ -17,6 +17,8 @@ on:
       - "SKILLS*"
       - "CLAUDE*"
       - "AGENT.MD"
+      - ".claude/**/*.md"
+  workflow_dispatch:
 
 permissions:
   id-token: write   # Sigstore keyless OIDC token
