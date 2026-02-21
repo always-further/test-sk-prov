@@ -1,44 +1,125 @@
+# Sign instruction files with Sigstore keyless attestation.
+#
+# Produces .bundle sidecar files containing DSSE envelopes with in-toto
+# statements that nono's trust pipeline can verify. Uses GitHub Actions
+# OIDC for identity — Fulcio issues a short-lived certificate carrying
+# the repository, workflow, and ref claims.
+#
+# Consumer-side verification: nono's pre-exec trust scan validates bundles
+# against the user's local trust-policy.json (keyed, signed by the user).
+
 name: Sign instruction files
 
 on:
   push:
     branches: [main]
     paths:
-      - 'SKILLS.md'
-      - 'CLAUDE.md'
-      - 'AGENT.MD'
-  workflow_dispatch:
+      - "SKILLS*"
+      - "CLAUDE*"
+      - "AGENT.MD"
 
 permissions:
-  id-token: write
-  contents: write
+  id-token: write   # Sigstore keyless OIDC token
+  contents: write   # Commit .bundle sidecars
 
 jobs:
   sign:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
 
-      - name: Install nono
-        run: cargo install --path crates/nono-cli
-        # Or: cargo install nono-cli (once published)
-
-      - name: Sign instruction files (keyless)
+      - name: Discover instruction files
+        id: discover
         run: |
-          for f in SKILLS.md CLAUDE.md AGENT.MD; do
-            if [ -f "$f" ]; then
-              nono trust sign "$f" --keyless
-            fi
+          FILES=()
+
+          # Top-level instruction files
+          for pattern in SKILLS* CLAUDE* AGENT.MD; do
+            for f in $pattern; do
+              [ -f "$f" ] && FILES+=("$f")
+            done
           done
 
+          # .claude subdirectory
+          if [ -d .claude ]; then
+            while IFS= read -r -d '' f; do
+              FILES+=("$f")
+            done < <(find .claude -name '*.md' -print0)
+          fi
+
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "No instruction files found."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+          # Write newline-separated file list
+          printf '%s\n' "${FILES[@]}" > /tmp/instruction-files.txt
+          echo "Discovered $(wc -l < /tmp/instruction-files.txt) instruction file(s):"
+          cat /tmp/instruction-files.txt
+
+      - name: Sign instruction files
+        if: steps.discover.outputs.found == 'true'
+        run: |
+          PREDICATE_TYPE="https://nono.dev/attestation/instruction-file/v1"
+
+          while IFS= read -r file; do
+            filename=$(basename "$file")
+            digest=$(sha256sum "$file" | cut -d' ' -f1)
+
+            # Build the in-toto predicate body.
+            # For keyless bundles the signer identity comes from the Fulcio
+            # certificate, not the predicate — but we include repo metadata
+            # for auditability.
+            predicate=$(mktemp)
+            cat > "$predicate" <<PRED
+          {
+            "version": 1,
+            "signer": {
+              "kind": "keyless",
+              "oidc_issuer": "https://token.actions.githubusercontent.com",
+              "repository": "${GITHUB_REPOSITORY}",
+              "workflow": "${GITHUB_WORKFLOW_REF}",
+              "ref": "${GITHUB_REF}"
+            }
+          }
+          PRED
+
+            echo "Signing $file (sha256:${digest:0:12}...)"
+
+            cosign attest-blob \
+              --yes \
+              --type "$PREDICATE_TYPE" \
+              --predicate "$predicate" \
+              --bundle "${file}.bundle" \
+              "$file"
+
+            rm -f "$predicate"
+            echo "  -> ${file}.bundle"
+          done < /tmp/instruction-files.txt
+
       - name: Commit bundles
+        if: steps.discover.outputs.found == 'true'
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add '*.bundle'
-          git diff --staged --quiet || git commit -m "chore: update instruction file signatures"
-          git push
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          # Stage only .bundle files for discovered instruction files
+          while IFS= read -r file; do
+            bundle="${file}.bundle"
+            [ -f "$bundle" ] && git add "$bundle"
+          done < /tmp/instruction-files.txt
+
+          if git diff --cached --quiet; then
+            echo "No bundle changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore: update instruction file attestation bundles"
+          git push
